@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, String, Text, Integer, Date, DateTime, ForeignKey, Boolean, select, func, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session, relationship
+from sqlalchemy import inspect, text
 
 APP_SECRET = os.getenv('APP_SECRET', 'dev-only-secret-change-this-before-deployment-please')
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./taskflow.db')
@@ -21,6 +22,7 @@ class User(Base):
     password_hash: Mapped[str]=mapped_column(String(300))
     role: Mapped[str]=mapped_column(String(20), default='employee')
     department: Mapped[str]=mapped_column(String(100), default='Engineering')
+    skills: Mapped[str] = mapped_column(String(500), default='')
     active: Mapped[bool]=mapped_column(Boolean, default=True)
     created_at: Mapped[datetime]=mapped_column(DateTime, default=datetime.utcnow)
 class Project(Base):
@@ -55,6 +57,17 @@ class Activity(Base):
     details: Mapped[str]=mapped_column(Text, default='')
     created_at: Mapped[datetime]=mapped_column(DateTime, default=datetime.utcnow)
 Base.metadata.create_all(engine)
+# Add skills column to existing databases safely
+with engine.begin() as connection:
+    columns = {
+        column["name"]
+        for column in inspect(connection).get_columns("users")
+    }
+
+    if "skills" not in columns:
+        connection.execute(
+            text("ALTER TABLE users ADD COLUMN skills TEXT DEFAULT ''")
+        )
 app=FastAPI(title='TaskFlow Production API', version='2.0.0', description='Role-based employee task tracking')
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174').split(','), allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 def db_dep():
@@ -90,13 +103,19 @@ def manager(user: User=Depends(current_user)) -> User:
     return user
 def activity(db, actor, action, details='', task_id=None):
     db.add(Activity(actor_id=actor.id if actor else None, task_id=task_id, action=action, details=details))
-def user_out(u): return {'id':u.id,'name':u.name,'email':u.email,'role':u.role,'department':u.department,'active':u.active,'created_at':u.created_at.isoformat() if u.created_at else None}
+def user_out(u): return {'id':u.id,'name':u.name,'email':u.email,'role':u.role,'department':u.department,'skills': u.skills or '','active':u.active,'created_at':u.created_at.isoformat() if u.created_at else None}
 def project_out(p): return {'id':p.id,'name':p.name,'description':p.description,'status':p.status,'created_at':p.created_at.isoformat() if p.created_at else None}
 def task_out(t, db):
     assignee=db.get(User,t.assigned_to_id); creator=db.get(User,t.created_by_id); project=db.get(Project,t.project_id) if t.project_id else None
     return {'id':t.id,'title':t.title,'description':t.description,'assigned_to_id':t.assigned_to_id,'assigned_to':assignee.name if assignee else 'Unknown','assignee_email':assignee.email if assignee else '', 'project_id':t.project_id,'project':project.name if project else 'General','status':t.status,'priority':t.priority,'due_date':t.due_date.isoformat() if t.due_date else None,'progress':t.progress,'created_by':creator.name if creator else 'Unknown','created_at':t.created_at.isoformat() if t.created_at else None,'updated_at':t.updated_at.isoformat() if t.updated_at else None,'started_at':t.started_at.isoformat() if t.started_at else None,'completed_at':t.completed_at.isoformat() if t.completed_at else None,'overdue':bool(t.due_date and t.due_date<date.today() and t.status!='Completed')}
 class LoginIn(BaseModel): email: str; password: str
-class MemberIn(BaseModel): name: str=Field(min_length=2,max_length=120); email: str; password: str=Field(min_length=8); role: str='employee'; department: str='Engineering'
+class MemberIn(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    email: str
+    password: str = Field(min_length=8)
+    department: str = ""
+    role: str = "employee"
+    skills: list[str] = Field(default_factory=list)
 class TaskIn(BaseModel): title: str=Field(min_length=2,max_length=200); description: str=''; assigned_to_id: int; project_id: Optional[int]=None; priority: str='Medium'; due_date: Optional[date]=None
 class TaskUpdate(BaseModel): status: Optional[str]=None; progress: Optional[int]=Field(default=None,ge=0,le=100); title: Optional[str]=None; description: Optional[str]=None; assigned_to_id: Optional[int]=None; project_id: Optional[int]=None; priority: Optional[str]=None; due_date: Optional[date]=None
 class ProjectIn(BaseModel): name: str=Field(min_length=2,max_length=160); description: str=''
@@ -197,8 +216,43 @@ def add_member(data:MemberIn,u:User=Depends(manager),db:Session=Depends(db_dep))
     if data.role not in ['employee']: raise HTTPException(422,'Only employee accounts can be created here')
     email=data.email.strip().lower()
     if db.scalar(select(User).where(User.email==email)): raise HTTPException(409,'An account with this email already exists')
-    p=User(name=data.name.strip(),email=email,password_hash=hash_password(data.password),role='employee',department=data.department.strip() or 'Engineering')
+    p = User(
+    name=data.name.strip(),
+    email=email,
+    password_hash=hash_password(data.password),
+    role='employee',
+    department=data.department,
+    skills=",".join(data.skills)
+)
     db.add(p); activity(db,u,'Added team member',f'{p.name} ({p.email})'); db.commit(); db.refresh(p); return user_out(p)
+class SkillsUpdate(BaseModel):
+    skills: list[str] = Field(default_factory=list)
+
+
+@app.put('/api/members/{user_id}/skills')
+def update_member_skills(
+    user_id: int,
+    data: SkillsUpdate,
+    u: User = Depends(manager),
+    db: Session = Depends(db_dep)
+):
+    member = db.get(User, user_id)
+
+    if not member or member.role != 'employee':
+        raise HTTPException(404, 'Employee not found')
+
+    member.skills = ', '.join(
+        skill.strip() for skill in data.skills if skill.strip()
+    )
+
+    db.commit()
+    db.refresh(member)
+
+    return {
+        'id': member.id,
+        'name': member.name,
+        'skills': member.skills
+    }
 @app.patch('/api/members/{user_id}/active')
 def member_active(user_id:int,active:bool,u:User=Depends(manager),db:Session=Depends(db_dep)):
     p=db.get(User,user_id)
