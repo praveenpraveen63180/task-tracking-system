@@ -9,7 +9,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker,
 from sqlalchemy import inspect, text
 
 APP_SECRET = os.getenv('APP_SECRET', 'dev-only-secret-change-this-before-deployment-please')
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./taskflow.db')
+DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql+psycopg://postgres:postgres@postgresql:5432/taskflow_db')
 connect_args = {'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
